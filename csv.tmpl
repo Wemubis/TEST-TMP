@@ -1,0 +1,20 @@
+{{- /*
+Template CSV pour Grype — étendu à partir du csv.tmpl d'origine.
+
+Colonnes ajoutées par rapport à la version initiale : Type, Fix State,
+Fixed In et Data Source. Elles sont nécessaires pour alimenter le tableau du
+rapport HTML et, plus tard, pour distinguer les vulnérabilités corrigeables de
+celles qui ne le sont pas.
+
+Machine et Image ne figurent pas ici : Grype ne connaît ni l'une ni l'autre.
+C'est le script d'analyse qui les ajoute en tête de chaque ligne.
+
+Champs volontairement absents : Description et Related URLs. Ils contiennent
+des guillemets et des virgules qui casseraient le CSV, et Go ne dispose pas
+nativement d'une fonction d'échappement. Voir la note du README pour les
+ajouter une fois le comportement de `replace` confirmé sur votre version.
+*/ -}}
+"Package","Version Installed","Type","Vulnerability ID","Severity","Fix State","Fixed In","Data Source"
+{{- range .Matches}}
+"{{.Artifact.Name}}","{{.Artifact.Version}}","{{.Artifact.Type}}","{{.Vulnerability.ID}}","{{.Vulnerability.Severity}}","{{.Vulnerability.Fix.State}}","{{range $i, $v := .Vulnerability.Fix.Versions}}{{if $i}} {{end}}{{$v}}{{end}}","{{.Vulnerability.DataSource}}"
+{{- end}}
