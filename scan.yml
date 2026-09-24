@@ -1,0 +1,81 @@
+---
+- name: Analyse des images de conteneurs
+  hosts: conteneurs
+  gather_facts: true
+
+  vars_prompt:
+    - name: ssh_password
+      prompt: "Mot de passe SSH (vide = par cle)"
+      private: true
+      default: ""
+      unsafe: true
+
+  vars:
+    images: []                          # vide = toutes les images taguées
+    tmp: /var/tmp/vulnscan              # archives, sur la machine locale
+    out: "{{ playbook_dir }}/../resultats"
+    tmpl: "{{ playbook_dir }}/../templates/csv.tmpl"
+    grype: grype
+    ansible_password: "{{ ssh_password | default('') }}"
+    ssh_opts: >-
+      {{ '-o BatchMode=yes' if not ssh_password else '-o StrictHostKeyChecking=accept-new' }}
+      -o ControlMaster=auto
+      -o ControlPath=~/.ssh/cm-%r@%h:%p
+      -o ControlPersist=2h
+
+  pre_tasks:
+    - name: Préparer les répertoires locaux
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop: ["{{ tmp }}", "{{ out }}"]
+      delegate_to: localhost
+      run_once: true
+
+    - name: Effacer les résultats de l'exécution précédente
+      ansible.builtin.shell: "rm -f {{ out }}/*.csv"
+      delegate_to: localhost
+      run_once: true
+      changed_when: true
+
+  tasks:
+    - name: Détecter le moteur de conteneurs
+      ansible.builtin.shell: |
+        for r in podman docker; do
+          command -v "$r" >/dev/null 2>&1 && { echo "$r"; exit 0; }
+        done
+        exit 1
+      register: sonde
+      changed_when: false
+      failed_when: false
+
+    - name: Ignorer la machine sans moteur de conteneurs
+      ansible.builtin.meta: end_host
+      when: sonde.rc != 0
+
+    - name: Mémoriser le moteur et la cible SSH
+      ansible.builtin.set_fact:
+        moteur: "{{ sonde.stdout | trim }}"
+        format_save: "{{ '--format docker-archive' if sonde.stdout | trim == 'podman' else '' }}"
+        cible_ssh: "{{ ansible_user | default('root') }}@{{ ansible_host | default(inventory_hostname) }}"
+
+    - name: Lister les images taguées
+      ansible.builtin.command: "{{ moteur }} images --format {{ gabarit }}"
+      vars:
+        gabarit: '{% raw %}{{.Repository}}:{{.Tag}}{% endraw %}'
+      register: liste
+      changed_when: false
+      when: images | length == 0
+
+    - name: Définir le périmètre
+      ansible.builtin.set_fact:
+        a_traiter: >-
+          {{ images if images | length > 0
+             else (liste.stdout_lines | reject('search', '<none>') | unique | list) }}
+
+    - name: Traiter chaque image
+      ansible.builtin.include_tasks: taches_image.yml
+      loop: "{{ a_traiter }}"
+      loop_control:
+        loop_var: ref
