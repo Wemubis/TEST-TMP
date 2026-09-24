@@ -1,0 +1,54 @@
+---
+# Traitement d'une image. Rien n'est écrit sur la machine distante.
+
+- name: "Relever l'identifiant de {{ ref }}"
+  ansible.builtin.command: "{{ moteur }} image inspect --format {{ gabarit }} {{ ref }}"
+  vars:
+    gabarit: '{% raw %}{{.Id}}{% endraw %}'
+  register: inspect
+  changed_when: false
+
+- name: "Normaliser l'identifiant de {{ ref }}"
+  ansible.builtin.set_fact:
+    # podman et docker ne préfixent pas l'identifiant de la même façon.
+    id_complet: "{{ inspect.stdout | trim | regex_replace('^sha256:', '') }}"
+    court: "{{ (inspect.stdout | trim | regex_replace('^sha256:', ''))[:12] }}"
+
+- name: "Rapatrier {{ ref }} en flux, sans écriture sur la machine"
+  ansible.builtin.shell:
+    cmd: >-
+      ssh -n {{ ssh_opts }} {{ cible_ssh }}
+      "{{ moteur }} save {{ format_save }} '{{ id_complet }}'"
+      > {{ tmp }}/{{ inventory_hostname }}_{{ court }}.tar
+  delegate_to: localhost
+  changed_when: true
+
+- name: "Analyser l'archive de {{ ref }}"
+  ansible.builtin.command:
+    cmd: >-
+      {{ grype }} docker-archive:{{ tmp }}/{{ inventory_hostname }}_{{ court }}.tar
+      -o template -t {{ tmpl }} --file {{ tmp }}/{{ inventory_hostname }}_{{ court }}.csv
+  environment:
+    GRYPE_DB_AUTO_UPDATE: "false"
+    GRYPE_CHECK_FOR_APP_UPDATE: "false"
+  delegate_to: localhost
+  changed_when: true
+
+- name: "Ajouter les colonnes Machine et Image pour {{ ref }}"
+  ansible.builtin.shell:
+    cmd: |
+      awk -v m="{{ ansible_hostname }}" -v i="{{ ref | basename }}" '
+        NR==1 { print "\"Machine\",\"Image\"," $0; next }
+        NF    { print "\"" m "\",\"" i "\"," $0 }
+      ' {{ tmp }}/{{ inventory_hostname }}_{{ court }}.csv > {{ out }}/{{ inventory_hostname }}_{{ court }}.csv
+  delegate_to: localhost
+  changed_when: true
+
+- name: "Purger l'archive de {{ ref }}"
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - "{{ tmp }}/{{ inventory_hostname }}_{{ court }}.tar"
+    - "{{ tmp }}/{{ inventory_hostname }}_{{ court }}.csv"
+  delegate_to: localhost

@@ -1,0 +1,82 @@
+---
+# Équivalent Ansible du script bash : inventaire des images, rapatriement en
+# flux vers la machine locale, analyse par Grype, purge immédiate.
+#
+#   ansible-playbook -i inventaire.yml scan.yml
+#   ansible-playbook -i inventaire.yml scan.yml -e '{"images":["nginx:1.21"]}'
+
+- name: Analyse des images de conteneurs
+  hosts: conteneurs
+  gather_facts: true          # fournit ansible_hostname, qui remplace `hostname -s`
+
+  vars:
+    images: []                          # vide = toutes les images taguées
+    tmp: /var/tmp/vulnscan              # archives, sur la machine locale
+    out: "{{ playbook_dir }}/../resultats"
+    tmpl: "{{ playbook_dir }}/../templates/csv.tmpl"
+    grype: grype
+    # Options passées au ssh du rapatriement. Ce ssh est brut : il n'hérite
+    # ni de ansible_ssh_private_key_file ni de ansible_password.
+    # Clé dédiée      : "-o BatchMode=yes -i ~/.ssh/vulnscan"
+    # Rebond          : ajouter -J utilisateur@rebond
+    ssh_opts: "-o BatchMode=yes"
+
+  pre_tasks:
+    - name: Préparer les répertoires locaux
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop: ["{{ tmp }}", "{{ out }}"]
+      delegate_to: localhost
+      run_once: true
+
+    - name: Effacer les résultats de l'exécution précédente
+      ansible.builtin.shell: "rm -f {{ out }}/*.csv"
+      delegate_to: localhost
+      run_once: true
+      changed_when: true
+
+  tasks:
+    - name: Détecter le moteur de conteneurs
+      ansible.builtin.shell: |
+        for r in podman docker; do
+          command -v "$r" >/dev/null 2>&1 && { echo "$r"; exit 0; }
+        done
+        exit 1
+      register: sonde
+      changed_when: false
+      failed_when: false
+
+    - name: Ignorer la machine sans moteur de conteneurs
+      ansible.builtin.meta: end_host
+      when: sonde.rc != 0
+
+    - name: Mémoriser le moteur et la cible SSH
+      ansible.builtin.set_fact:
+        moteur: "{{ sonde.stdout | trim }}"
+        # docker save refuse --format ; podman l'exige pour garantir le format.
+        format_save: "{{ '--format docker-archive' if sonde.stdout | trim == 'podman' else '' }}"
+        # Calculée ici, dans le contexte de la machine, pour rester utilisable
+        # dans les tâches déléguées à localhost.
+        cible_ssh: "{{ ansible_user | default('root') }}@{{ ansible_host | default(inventory_hostname) }}"
+
+    - name: Lister les images taguées
+      ansible.builtin.command: "{{ moteur }} images --format {{ gabarit }}"
+      vars:
+        gabarit: '{% raw %}{{.Repository}}:{{.Tag}}{% endraw %}'
+      register: liste
+      changed_when: false
+      when: images | length == 0
+
+    - name: Définir le périmètre
+      ansible.builtin.set_fact:
+        a_traiter: >-
+          {{ images if images | length > 0
+             else (liste.stdout_lines | reject('search', '<none>') | unique | list) }}
+
+    - name: Traiter chaque image
+      ansible.builtin.include_tasks: taches_image.yml
+      loop: "{{ a_traiter }}"
+      loop_control:
+        loop_var: ref
