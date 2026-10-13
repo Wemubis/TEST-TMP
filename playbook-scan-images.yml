@@ -1,0 +1,217 @@
+---
+# Analyse de vulnérabilités des images de conteneurs.
+#
+# La sélection des machines est faite par Satellite : ce playbook ne porte
+# aucun inventaire ni aucune destination. Il travaille sur les hôtes qui lui
+# sont remis.
+#
+# Déroulé :
+#   1. sur chaque hôte : inventaire des images, en lecture seule ;
+#   2. sur la capsule : déduplication, puis pour chaque image unique
+#      rapatriement, analyse et purge ;
+#   3. sur la capsule : fusion des CSV en un rapport.
+#
+# Les tâches de la capsule portent delegate_to: localhost et run_once: true.
+# localhost désigne la capsule, puisque c'est elle qui exécute le playbook.
+#
+# Rien n'est écrit sur le disque des hôtes : podman save écrit sur sa sortie
+# standard, le flux traverse SSH, et l'archive se matérialise sur la capsule.
+#
+# La logique vit dans la collection vulnscan.scan, embarquée sous
+# collections/ : aucune installation préalable n'est nécessaire.
+#
+#   inventaire_images  sur chaque hôte : détection du moteur et liste
+#   plan_images        sur la capsule : déduplication
+#   traiter_images     sur la capsule : rapatriement, Grype, CSV, purge
+#   rapport_html       sur la capsule : fusion des CSV en un rapport
+#
+# Chaque module se documente avec `ansible-doc vulnscan.scan.<nom>`.
+
+- name: Analyse des images de conteneurs
+  hosts: all
+  gather_facts: true
+
+  vars:
+    # Répertoires sur la capsule.
+    rep_travail: /var/tmp/vulnscan
+    rep_resultats: /var/lib/vulnscan/resultats
+    rapport_html: /var/lib/vulnscan/rapport.html
+
+    gabarit_csv: "{{ playbook_dir }}/templates/template-csv-grype.tmpl"
+    gabarit_html: "{{ playbook_dir }}/templates/template-html-rapport.tmpl"
+
+    grype: grype
+    severites_retenues: [Critical, High, Medium]
+
+    # Expressions régulières sur la référence. Les images non taguées sont
+    # écartées d'office.
+    exclusions: []
+
+    # Satellite se charge de la connexion : compte, clé, port et rebond sont
+    # lus dans l'inventaire qu'il génère (ansible_user, ansible_port,
+    # ansible_ssh_private_key_file, ansible_ssh_common_args).
+    #
+    # Le seul réglage à vérifier est la montée en privilège. Elle suit
+    # ansible_become ; forcer avec -e sudo_distant=true si le compte de
+    # connexion n'est pas root et que Satellite ne pose pas cette variable.
+    sudo_distant: "{{ ansible_become | default(false) }}"
+
+    # Mot de passe SSH. Vide = authentification par clé (recommandé).
+    # Pour des essais : -e ssh_password='...'   (paquet sshpass requis)
+    ssh_password: ""
+
+  tasks:
+
+    # ================================================================= #
+    # Sur chaque hôte : inventaire, en lecture seule                     #
+    # ================================================================= #
+
+    # become est repris de l'inventaire généré par Satellite : si le compte
+    # de connexion n'est pas root, Ansible applique lui-même sudo.
+    - name: Inventorier les images de l'hôte
+      vulnscan.scan.inventaire_images:
+        exclusions: "{{ exclusions }}"
+      register: inventaire
+      become: "{{ sudo_distant | bool }}"
+
+    - name: Écarter l'hôte sans moteur de conteneurs
+      ansible.builtin.meta: end_host
+      when: not inventaire.trouve
+
+    - name: Afficher le décompte par hôte
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventaire.moteur }} :
+          {{ inventaire.images | length }} image(s) taguée(s),
+          {{ inventaire.ecartees.non_taguees }} sans tag,
+          {{ inventaire.ecartees.par_motif | length }} écartée(s) par motif
+
+    # ================================================================= #
+    # Sur la capsule : déduplication, analyse, rapport                   #
+    # ================================================================= #
+
+    - name: Préparer le répertoire de travail de la capsule
+      ansible.builtin.file:
+        path: "{{ rep_travail }}"
+        state: directory
+        mode: "0755"
+      delegate_to: localhost
+      run_once: true
+
+    # Repartir d'un répertoire vide : une image analysée hier mais disparue
+    # depuis laisserait sinon son CSV dans le rapport du jour.
+    - name: Repartir d'un répertoire de résultats vide
+      ansible.builtin.file:
+        path: "{{ rep_resultats }}"
+        state: "{{ item }}"
+        mode: "0755"
+      loop: [absent, directory]
+      delegate_to: localhost
+      run_once: true
+
+    # ansible_play_hosts ne contient que les hôtes encore actifs : ceux
+    # écartés plus haut par end_host en sont absents.
+    #
+    # Les réglages de connexion sont repris ici depuis les variables
+    # d'Ansible, puis transmis au module : port, clé et rebond déclarés dans
+    # l'inventaire s'appliquent donc au rapatriement.
+    - name: Rassembler les inventaires des hôtes
+      ansible.builtin.set_fact:
+        inventaires: "{{ inventaires | default([]) + [entree] }}"
+      vars:
+        hv: "{{ hostvars[hote] }}"
+        entree:
+          cle: "{{ hote }}"
+          nom: "{{ hv.ansible_hostname | default(hote) }}"
+          moteur: "{{ hv.inventaire.moteur | default('podman') }}"
+          images: "{{ hv.inventaire.images | default([]) }}"
+          cible: "{{ hv.ansible_user | default('root') }}@{{ hv.ansible_host | default(hote) }}"
+          # Le rapatriement passe par un ssh direct, qui n'hérite pas du
+          # become d'Ansible : le préfixe est donc reconstruit ici, à partir
+          # du même réglage d'inventaire.
+          privilege: "{{ (hv.ansible_become_method | default('sudo')) ~ ' -n '
+                         if (sudo_distant | bool) else '' }}"
+          options_ssh: >-
+            {{ '-o BatchMode=yes' if not ssh_password
+               else '-o StrictHostKeyChecking=accept-new' }}
+            {{ ('-p ' ~ hv.ansible_port) if hv.ansible_port is defined else '' }}
+            {{ ('-i ' ~ hv.ansible_ssh_private_key_file)
+               if hv.ansible_ssh_private_key_file is defined else '' }}
+            {{ hv.ansible_ssh_common_args | default('') }}
+      loop: "{{ ansible_play_hosts }}"
+      loop_control:
+        loop_var: hote
+        label: "{{ hote }}"
+      delegate_to: localhost
+      run_once: true
+
+    - name: Construire le plan dédoublonné
+      vulnscan.scan.plan_images:
+        inventaires: "{{ inventaires }}"
+      register: plan
+      delegate_to: localhost
+      run_once: true
+
+    - name: Résumer le plan
+      ansible.builtin.debug:
+        msg: >-
+          {{ plan.images_uniques }} image(s) unique(s) à analyser,
+          pour {{ plan.presences }} présence(s)
+          sur {{ ansible_play_hosts | length }} hôte(s).
+      delegate_to: localhost
+      run_once: true
+
+    # Une image à la fois : rapatriement, analyse, purge. L'archive est
+    # détruite avant de passer à la suivante, de sorte que l'occupation disque
+    # de la capsule reste bornée à la plus grosse image, quel que soit le parc.
+    - name: Rapatrier, analyser et purger chaque image unique
+      vulnscan.scan.traiter_images:
+        images: "{{ plan.images }}"
+        repertoire_travail: "{{ rep_travail }}"
+        repertoire_resultats: "{{ rep_resultats }}"
+        gabarit_csv: "{{ gabarit_csv }}"
+        grype: "{{ grype }}"
+        mot_de_passe_ssh: "{{ ssh_password }}"
+      register: traitement
+      delegate_to: localhost
+      run_once: true
+
+    - name: Résumer le traitement
+      ansible.builtin.debug:
+        msg: >-
+          {{ traitement.reussites | length }} image(s) analysée(s),
+          {{ traitement.echecs | length }} en échec,
+          {{ traitement.fichiers_csv }} CSV produit(s)
+      delegate_to: localhost
+      run_once: true
+
+    # Une image non analysée doit apparaître, jamais disparaître en silence.
+    - name: Signaler les images en échec
+      ansible.builtin.debug:
+        msg: "{{ traitement.echecs }}"
+      when: traitement.echecs | length > 0
+      delegate_to: localhost
+      run_once: true
+
+    - name: Produire le rapport HTML
+      vulnscan.scan.rapport_html:
+        repertoire_csv: "{{ rep_resultats }}"
+        gabarit: "{{ gabarit_html }}"
+        destination: "{{ rapport_html }}"
+        severites: "{{ severites_retenues }}"
+        # api.iconify.design n'est pas joignable depuis la capsule : sans
+        # cela, les boutons d'export sont des cases grises.
+        icones_externes: false
+      register: rapport
+      delegate_to: localhost
+      run_once: true
+
+    - name: Bilan
+      ansible.builtin.debug:
+        msg:
+          - "{{ rapport.vulnerabilites }} constatation(s) retenue(s)"
+          - "{{ rapport.par_severite }}"
+          - "{{ rapport.machines | length }} machine(s), {{ rapport.images | length }} image(s)"
+          - "rapport : {{ rapport_html }}"
+      delegate_to: localhost
+      run_once: true
