@@ -1,0 +1,114 @@
+---
+- name: Lire les versions publiées par la machine X
+  ansible.builtin.set_fact:
+    grype_distribution: "{{ role_path }}/files/current"
+    grype_manifest: "{{ lookup('ansible.builtin.file', role_path + '/files/current/manifest.json') | from_json }}"
+
+- name: Vérifier la plateforme
+  ansible.builtin.assert:
+    that:
+      - grype_manifest.db_format | default('') == 'cache-v1'
+      - ansible_os_family == 'RedHat'
+      - ansible_architecture in ['x86_64', 'aarch64']
+      - grype_manifest.arch == ('linux_amd64' if ansible_architecture == 'x86_64' else 'linux_arm64')
+    fail_msg: Le RPM publié ne correspond pas à la capsule.
+
+- name: Vérifier les fichiers locaux avant toute installation
+  ansible.builtin.stat:
+    path: "{{ grype_distribution }}/{{ item }}"
+    checksum_algorithm: sha256
+  loop: [grype.rpm, db-cache.tar.gz]
+  register: grype_fichiers
+
+- name: Valider les empreintes
+  ansible.builtin.assert:
+    that:
+      - grype_fichiers.results[0].stat.checksum | default('') == grype_manifest.rpm_sha256
+      - grype_fichiers.results[1].stat.checksum | default('') == grype_manifest.db_sha256
+    fail_msg: Fichiers absents, corrompus ou non matérialisés depuis GitLab.
+
+- name: Préparer le cache privé du compte satellite
+  ansible.builtin.file:
+    path: "{{ grype_cache }}"
+    state: directory
+    owner: "{{ grype_compte }}"
+    mode: '0700'
+
+- name: Reprendre la propriété d'un éventuel cache existant
+  ansible.builtin.file:
+    path: "{{ grype_cache }}"
+    state: directory
+    owner: "{{ grype_compte }}"
+    recurse: true
+
+- name: Lire la version RPM installée
+  ansible.builtin.command: rpm -q grype --queryformat '%{VERSION}'
+  register: grype_installe
+  failed_when: false
+  changed_when: false
+
+- name: Installer le RPM local sans consulter les dépôts réseau
+  ansible.builtin.dnf:
+    name: "{{ grype_distribution }}/grype.rpm"
+    state: present
+    disable_gpg_check: true
+    disablerepo: '*'
+  when: grype_installe.rc != 0 or grype_installe.stdout != grype_manifest.version
+  register: grype_installation
+
+- name: Gérer la DB sans connexion Internet
+  become: true
+  become_user: "{{ grype_compte }}"
+  environment:
+    GRYPE_DB_CACHE_DIR: "{{ grype_cache }}"
+    GRYPE_DB_AUTO_UPDATE: 'false'
+    GRYPE_CHECK_FOR_APP_UPDATE: 'false'
+  block:
+    - name: Vérifier le binaire réellement utilisé par les scans
+      ansible.builtin.command: grype version
+      register: grype_version_executee
+      changed_when: false
+
+    - name: Refuser un autre binaire Grype présent dans le PATH
+      ansible.builtin.assert:
+        that: >-
+          grype_version_executee.stdout is search('(?m)^Version:\s+' ~ (grype_manifest.version | regex_escape) ~ '\s*$')
+
+    - name: Lire l'empreinte de la DB déjà importée
+      ansible.builtin.slurp:
+        src: "{{ grype_cache }}/archive.sha256"
+      register: grype_db_marqueur
+      failed_when: false
+      changed_when: false
+
+    - name: Vérifier la DB existante
+      ansible.builtin.command: grype db status
+      register: grype_db_avant
+      failed_when: false
+      changed_when: false
+
+    - name: Restaurer le cache uniquement si la DB a changé ou doit être réparée
+      ansible.builtin.unarchive:
+        src: "{{ grype_distribution }}/db-cache.tar.gz"
+        dest: "{{ grype_cache }}"
+        remote_src: true
+      when: >-
+        (grype_db_marqueur.content | default('') | b64decode | trim) != grype_manifest.db_sha256
+        or grype_db_avant.rc != 0
+        or grype_installation.changed | default(false)
+      changed_when: true
+
+    - name: Valider la DB importée
+      ansible.builtin.command: grype db status
+      register: grype_db_apres
+      changed_when: false
+
+    - name: Mémoriser l'empreinte après validation
+      ansible.builtin.copy:
+        content: "{{ grype_manifest.db_sha256 }}\n"
+        dest: "{{ grype_cache }}/archive.sha256"
+        mode: '0600'
+
+    - name: Afficher l'état prêt pour le scan
+      ansible.builtin.debug:
+        msg: "Grype {{ grype_manifest.version }} ; {{ grype_db_apres.stdout }}"

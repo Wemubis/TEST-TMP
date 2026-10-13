@@ -1,0 +1,3 @@
+---
+grype_compte: satellite
+grype_cache: /var/lib/vulnscan/grype-db

@@ -1,0 +1,100 @@
+---
+# À importer dans Satellite comme Job Template Ansible.
+# Sélectionner uniquement la capsule DEV ; utilisateur SSH/effectif : satellite.
+- name: Exécuter les rôles GitLab depuis le playbook Satellite
+  hosts: all
+  gather_facts: true
+  become: false
+  vars:
+    gitlab_depot: git@gitlab.exemple.fr:infra/grype.git
+    gitlab_ref: main
+    grype_action: campagne  # campagne ou maj
+    scan_hotes:
+      hote-dev-01:
+        ansible_host: 10.150.0.11
+      hote-dev-02:
+        ansible_host: 10.150.0.12
+  tasks:
+    - name: Vérifier la configuration
+      ansible.builtin.assert:
+        that:
+          - ansible_user_id == 'satellite'
+          - grype_action in ['campagne', 'maj']
+          - "'gitlab.exemple.fr' not in gitlab_depot"
+          - scan_hotes | length > 0
+
+    - name: Créer le dossier privé du job
+      ansible.builtin.tempfile:
+        state: directory
+        path: "{{ ansible_user_dir }}"
+        prefix: grype-job-
+      register: travail
+
+    - name: Préparer et exécuter la campagne
+      block:
+        - name: Récupérer les rôles et la distribution publiés dans GitLab
+          ansible.builtin.git:
+            repo: "{{ gitlab_depot }}"
+            version: "{{ gitlab_ref }}"
+            dest: "{{ travail.path }}/code"
+            depth: 1
+            single_branch: true
+            accept_hostkey: false
+          register: revision
+
+        - name: Afficher le commit utilisé
+          ansible.builtin.debug:
+            msg: "Révision GitLab : {{ revision.after }}"
+
+        - name: Matérialiser sur la capsule le playbook défini dans Satellite
+          ansible.builtin.copy:
+            content: >-
+              {{ [{'name': 'Grype DEV', 'hosts': 'localhost', 'connection': 'local',
+                   'gather_facts': true, 'become': true, 'become_user': 'root',
+                   'vars': {'scan_hotes': scan_hotes},
+                   'roles': ['maj_grype_capsule'] + (['scan_images_capsule'] if grype_action == 'campagne' else [])}] | to_nice_yaml }}
+            dest: "{{ travail.path }}/execution.yml"
+            mode: '0600'
+
+        - name: Fixer la configuration Ansible du job
+          ansible.builtin.copy:
+            content: |
+              [defaults]
+              host_key_checking = True
+              retry_files_enabled = False
+            dest: "{{ travail.path }}/ansible.cfg"
+            mode: '0600'
+
+        - name: Installer ou actualiser depuis GitLab puis scanner
+          ansible.builtin.command:
+            argv:
+              - flock
+              - -n
+              - "{{ ansible_user_dir }}/grype-campagne.lock"
+              - ansible-playbook
+              - -i
+              - localhost,
+              - "{{ travail.path }}/execution.yml"
+            chdir: "{{ travail.path }}"
+          environment:
+            ANSIBLE_CONFIG: "{{ travail.path }}/ansible.cfg"
+            ANSIBLE_ROLES_PATH: "{{ travail.path }}/code/roles"
+            GRYPE_DB_AUTO_UPDATE: 'false'
+            GRYPE_CHECK_FOR_APP_UPDATE: 'false'
+          register: campagne
+          changed_when: true
+          failed_when: false
+
+        - name: Afficher le résultat dans Satellite
+          ansible.builtin.debug:
+            msg: "{{ campagne.stdout_lines[-30:] }}"
+
+        - name: Reporter le statut à Satellite
+          ansible.builtin.assert:
+            that: campagne.rc == 0
+            fail_msg: "Campagne en échec ou déjà en cours. {{ campagne.stderr }}"
+      always:
+        - name: Nettoyer la copie temporaire des rôles et fichiers
+          ansible.builtin.file:
+            path: "{{ travail.path }}"
+            state: absent
